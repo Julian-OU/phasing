@@ -33,8 +33,6 @@ for emitPhotonsNumber in [1e10, 2e9]:
     phasing.SetInitRealSpace("random")
     phasing.SetInitSupport("custom", initSupport=perfectSupport)
 
-    # phasing.SetOSSFramework(period=900)
-
     phasing.SetMultigridMethod(5)
     phasing.SetPhasingMethod("HIO", 100, (1, 2, 3, 4), beta=0.9)
     phasing.SetPhasingMethod("HIO", 400, 0, beta=0.9)

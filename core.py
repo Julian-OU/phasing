@@ -3,7 +3,7 @@ Phase retrieval image reconstruction for single particle imaging.
 
 Requirements
 ------------
-`numpy` `scipy` `cupy` `pytorch` `h5py` `pillow` `matplotlib` `tqdm`
+`numpy` `scipy` `cupy` `pytorch` `h5py` `pandas` `pillow` `matplotlib` `tqdm`
 
 Introduction
 ------------
@@ -25,7 +25,6 @@ from multiprocessing import Pool, cpu_count
 import cupy as cp
 import numpy as np
 import pandas as pd
-import torch as pt
 import torch.nn.functional as nn
 import torch.utils.dlpack as dl
 from cupy.fft import fft2 as fft
@@ -84,7 +83,7 @@ def GaussianKernel(size, sigma):
     """
     xx, yy = SetRealGrid(size)
     sigma2 = sigma * sigma
-    grid2 = shift(xx ** 2 + yy ** 2) / sigma2
+    grid2 = shift(xx**2 + yy**2) / sigma2
     return cp.exp(-grid2 / 2) / (2 * PI * sigma2)
 
 
@@ -96,7 +95,7 @@ def GaussianWindow(size, sigma):
     """
     xx, yy = SetFourierGrid(size)
     sigma2 = sigma * sigma
-    grid2 = shift(xx ** 2 + yy ** 2)
+    grid2 = shift(xx**2 + yy**2)
     try:
         grid2 = grid2 / sigma2
     except:
@@ -207,12 +206,11 @@ def PoissonDeviate(lam: float, seed=None):
 def Simulation(
     objectInput,
     oversamplingRatio: float,
-    poissonNoiseRatio: float,
+    emitPhotonsNumber: int,
     patternCoverRatio: float = 0,
     patternCoverShape="c",
     patternCoverUpper: float = INF,
     patternCoverLower: float = 0,
-    patternDiscretize=True,
     seed=None,
 ):
     """
@@ -222,15 +220,19 @@ def Simulation(
     ----------
      - objectInput (cupy.ndarray): Parameter of the poisson distribution.
      - oversamplingRatio (float): The oversampling ratio druing the diffraction pattern simulation.
-     - poissonNoiseRatio (float): The Poisson noise ratio added to the diffraction pattern intensity.
+     - emitPhotonsNumber (int): The number of photons emitted in the diffraction pattern simulation.
      - patternCoverRatio (float): The cover ratio of the low frequency part of the diffraction pattern.
+     - patternCoverUpper (float): The upper limit of the number of photons effectively detected by each pixel.
+     - patternCoverLower (float): The lower limit of the number of photons effectively detected by each pixel
      - seed (default: None): The seed for the random number generator of Poisson noise.
 
     Returns
     -------
-     - patternIntensity (cupy.ndarray): Simulated diffraction pattern.
-     - patternMask (cupy.ndarray): Mask of pattern for covered pixels.
-     - perfectSupport (cupy.ndarray): Perfect tight support.
+     - patternNoisedInt (cupy.ndarray): Simulated diffraction pattern with Possion noise.
+     - patternNoiseFree (cupy.ndarray): The expectation of an ideal diffraction pattern.
+     - patternMask (cupy.ndarray): The mask of pattern for covered pixels.
+     - perfectSupport (cupy.ndarray): Perfect tight support of object.
+     - SignalNoiseRatio (float): Signal to noise ratio of simulated diffraction pattern.
     """
 
     realSpace = objectInput / cp.max(objectInput)  # Normalizing
@@ -240,49 +242,59 @@ def Simulation(
     # Generating zero-density region
     realSpace = shift(cp.pad(realSpace, padding, "constant"))
     size = cp.shape(realSpace)
+    perfectSupport = realSpace > 0
     fourierSpace = fft(realSpace)
     # Shifted pattern intensity
-    patternIntensity = cp.abs(fourierSpace) ** 2
-    if patternDiscretize:
-        patternIntensity = cp.round(patternIntensity)
-    patternIntensity[patternIntensity > patternCoverUpper] = 0
-    patternIntensity[patternIntensity < patternCoverLower] = 0
+    patternNoiseFree = cp.abs(fourierSpace) ** 2
+    patternNoiseFree[patternNoiseFree > patternCoverUpper] = 0
+    patternNoiseFree[patternNoiseFree < patternCoverLower] = 0
     if patternCoverRatio != 0:  # Generating missing pixels
         xx, yy = SetFourierGrid(size)
         xx = shift(xx) * 2
         yy = shift(yy) * 2
         if patternCoverShape == "r":
-            patternIntensity[
+            patternNoiseFree[
                 cp.logical_and(
                     cp.abs(xx) < patternCoverRatio, cp.abs(
                         yy) < patternCoverRatio
                 ),
             ] = 0
         elif patternCoverShape == "c":
-            patternIntensity[xx ** 2 + yy ** 2 < (patternCoverRatio) ** 2] = 0
+            patternNoiseFree[xx**2 + yy**2 < (patternCoverRatio) ** 2] = 0
         elif patternCoverShape == "d":
-            patternIntensity[cp.abs(xx) + cp.abs(yy) < patternCoverRatio] = 0
+            patternNoiseFree[cp.abs(xx) + cp.abs(yy) < patternCoverRatio] = 0
         elif patternCoverShape == "upper":
-            num = round(size[0] * size[1] * patternCoverRatio ** 2)
+            num = round(size[0] * size[1] * patternCoverRatio**2)
             mask = cp.ones(size, dtype="bool")
             mask[cp.argpartition(cp.ravel(realSpace), -num)[-num:]] = False
-            patternIntensity[cp.reshape(mask, size)] = 0
+            patternNoiseFree[cp.reshape(mask, size)] = 0
         else:
             raise RuntimeError("Unsupported shape.")
-    patternMask = patternIntensity != 0  # Generating missing pixels mask
-    if poissonNoiseRatio != 0:  # Adding poisson noise
-        noiseIntensity = PoissonDeviate(
-            patternIntensity, seed) - patternIntensity
-        scaling = cp.mean(
-            (cp.abs(noiseIntensity) / patternIntensity)[patternIntensity != 0]
-        )
-        patternIntensity = (
-            patternIntensity + noiseIntensity / scaling * poissonNoiseRatio
-        )
-        patternIntensity = cp.round(patternIntensity)
-        patternIntensity[patternIntensity < 0] = 0
-    perfectSupport = realSpace > 0
-    return patternIntensity, patternMask, perfectSupport, realSpace, fourierSpace
+    if emitPhotonsNumber > 0:
+        totalIntensity = cp.sum(patternNoiseFree)
+        patternNoiseFree = (
+            patternNoiseFree * emitPhotonsNumber / totalIntensity
+        )  # Setting the number of photons
+        patternNoisedInt = PoissonDeviate(
+            patternNoiseFree, seed
+        )  # Generating poisson noise
+    else:
+        patternNoisedInt = patternNoiseFree
+    patternNoiseFree = cp.round(patternNoiseFree)
+    patternMask = patternNoisedInt != 0  # Generating missing pixels mask
+    SignalNoiseRatio = 10 * cp.log10(
+        cp.mean(patternNoiseFree)
+        / cp.mean((cp.abs(patternNoisedInt - patternNoiseFree)))
+    )  # Calculating noise ratio
+    return (
+        patternNoisedInt,
+        patternNoiseFree,
+        patternMask,
+        perfectSupport,
+        SignalNoiseRatio,
+        realSpace,
+        fourierSpace,
+    )
 
 
 class OSS(object):
@@ -346,13 +358,13 @@ class OSS(object):
         self.Reset()
         cp.cuda.Device(gpuDevice).use()
         self.processes = processes
-        patternIntensity = cp.asarray(patternIntensity)
+        patternIntensity = cp.copy(patternIntensity)
         self.patternIntensity = patternIntensity
         self.pattern = cp.sqrt(patternIntensity)
         self.size = cp.shape(patternIntensity)
         if patternIntyError is not None:
             self.FourierModulusProjector = self.FourierModulusProjectorLimit
-            self.patternIntyError = cp.asarray(patternIntyError)
+            self.patternIntyError = cp.copy(patternIntyError)
             self.patternUpper = cp.sqrt(
                 self.patternIntensity + self.patternIntyError)
             self.patternLower = cp.sqrt(
@@ -408,7 +420,7 @@ class OSS(object):
             if patternMask is None:
                 raise ValueError('Please input parameter "patternMask".')
             else:
-                self.mask = patternMask
+                self.mask = cp.copy(patternMask)
         else:
             raise ValueError("Unsupported method.")
 
@@ -482,7 +494,7 @@ class OSS(object):
             if initSupport is None:
                 raise ValueError('Please input parameter "initSupport".')
             else:
-                self.initSupport = initSupport
+                self.initSupport = cp.copy(initSupport)
         else:
             raise ValueError("Unsupported method.")
 
@@ -513,7 +525,8 @@ class OSS(object):
             path = path + "/"
         if not os.path.exists(path):
             warnings.warn(
-                "The directory does not exist and will be created.", RuntimeWarning,
+                "The directory does not exist and will be created.",
+                RuntimeWarning,
             )
             os.makedirs(path)
         if len(os.listdir(path)) != 0:
@@ -591,13 +604,19 @@ class OSS(object):
             if self.outputFourierSpaceH5:
                 self.pool.apply_async(
                     fio.WriteH5,
-                    (fourierSpace, fileName + ".h5",),
+                    (
+                        fourierSpace,
+                        fileName + ".h5",
+                    ),
                     error_callback=errCallBack,
                 )
             if self.outputFourierSpaceMAT:
                 self.pool.apply_async(
                     fio.WriteMAT,
-                    (fourierSpace, fileName + ".mat",),
+                    (
+                        fourierSpace,
+                        fileName + ".mat",
+                    ),
                     error_callback=errCallBack,
                 )
         if self.outputRealSpace:
@@ -606,25 +625,37 @@ class OSS(object):
             if self.outputRealSpaceH5:
                 self.pool.apply_async(
                     fio.WriteH5,
-                    (realSpace, fileName + ".h5",),
+                    (
+                        realSpace,
+                        fileName + ".h5",
+                    ),
                     error_callback=errCallBack,
                 )
             if self.outputRealSpaceMAT:
                 self.pool.apply_async(
                     fio.WriteMAT,
-                    (realSpace, fileName + ".mat",),
+                    (
+                        realSpace,
+                        fileName + ".mat",
+                    ),
                     error_callback=errCallBack,
                 )
             if self.outputRealSpacePNG:
                 self.pool.apply_async(
                     fio.WritePNG,
-                    (realSpace, fileName + ".png",),
+                    (
+                        realSpace,
+                        fileName + ".png",
+                    ),
                     error_callback=errCallBack,
                 )
             if self.outputRealSpaceTIF:
                 self.pool.apply_async(
                     fio.WriteTIF,
-                    (realSpace, fileName + ".tif",),
+                    (
+                        realSpace,
+                        fileName + ".tif",
+                    ),
                     error_callback=errCallBack,
                 )
         if self.outputSupport:
@@ -633,25 +664,37 @@ class OSS(object):
             if self.outputSupportH5:
                 self.pool.apply_async(
                     fio.WriteH5,
-                    (support, fileName + ".h5",),
+                    (
+                        support,
+                        fileName + ".h5",
+                    ),
                     error_callback=errCallBack,
                 )
             if self.outputSupportMAT:
                 self.pool.apply_async(
                     fio.WriteMAT,
-                    (support, fileName + ".mat",),
+                    (
+                        support,
+                        fileName + ".mat",
+                    ),
                     error_callback=errCallBack,
                 )
             if self.outputSupportPNG:
                 self.pool.apply_async(
                     fio.WritePNG,
-                    (support, fileName + ".png",),
+                    (
+                        support,
+                        fileName + ".png",
+                    ),
                     error_callback=errCallBack,
                 )
             if self.outputSupportTIF:
                 self.pool.apply_async(
                     fio.WriteTIF,
-                    (support, fileName + ".tif",),
+                    (
+                        support,
+                        fileName + ".tif",
+                    ),
                     error_callback=errCallBack,
                 )
 
@@ -1045,7 +1088,7 @@ class OSS(object):
         return realSpace
 
     def UpdateAndOutput(self, realSpace, i):
-        if 1+i % self.OSSFilterUpdatePeriod == 0:
+        if (1 + i) % self.OSSFilterUpdatePeriod == 0:
             self.OSSFilterUpdate()
         if (self.cumsum + i) % self.supportUpdatePeriod == self.supportUpdateMod:
             self.SupportUpdate(realSpace)
@@ -1099,6 +1142,54 @@ class OSS(object):
 
 
 class HMG(OSS):
+    """
+    General phasing class.
+
+    Using the following functions to set and control the reconstruction process.
+
+    Initialization
+    --------------
+    - `SetPatternMask(method, **kwargs)`
+    - `SetInitRealSpace(method, **kwargs)`
+    - `SetInitSupport(method, **kwargs)`
+
+    Multigrid
+    ---------
+    Set the number of levels for multiple grids.
+    - `SetMultigridMethod(num)`
+
+    Phasing Algorithm
+    -----------------
+    Successive calling can concatenate different algorithms.
+    - `SetPhasingMethod(method, girdLevel, **kwargs)`
+
+    Image Output
+    ------------
+    The following functions must be called to set output format.
+    - `SetOutput(path, period, processes)`
+    - `SetOutputFourierSpace(h5, mat)`
+    - `SetOutputRealSpace(h5, mat, png, tif)`
+    - `SetOutputSupport(h5, mat, png, tif)`
+
+    OSS Framework (optional)
+    ------------------------
+    Call only when needed. If not, OSS Framework will not be used.
+    - `SetOSSFramework(period, alpha)`
+
+    Support Update (optional)
+    -------------------------
+    If the following functions are not call, it will be phased with fixed support.
+    - `SetSupportUpdateMethod(self, period, offset)`
+    - `SetSupportUpdateBlur(radius, *args)`
+    - `SetSupportUpdateThreshold(threshold, *args)`
+    - `SetSupportUpdateArea(area, *args)`
+
+    Process Control
+    ---------------
+    - `Run()`: Once the setup is complete, call `Run()` to start phasing.
+    - `Reset()`: Reset all settings (for future GUIs).
+    """
+
     def __init__(
         self,
         patternIntensity,
@@ -1122,6 +1213,31 @@ class HMG(OSS):
         self, method: str, iterations: int, gridLevel: int = None, **kwargs
     ):
         """
+        Add reconstruction algorithm to phasing process for different grid levels. Each call to this
+        function will add a stage of reconstruction algorithm, which concatenates different algorithms
+        and parameters.
+
+        Parameters
+        ----------
+        - method (str): Reconstruction algorithm. The available reconstruction algorithm include\
+        "ER"`, `"SF"`, `"HIO"`, `"ERHIO"`, `"ASR"`, `"HPR"`, `"RAAR"`, and `"DM"`.
+            - `"ER"`: P_s P_m.
+            - `"SF"`: R_s P_m.
+            - `"HIO"`: if in support: P_m else: (I - beta P_m). Need to pass in the parameter `beta`.
+            - `"ERHIO"`: Alternate the ER and HIO algorithms periodically. Need to pass in parameter
+                `beta` (same as HIO), `HIO` (the number of HIO iterations per period), and `ER` (the
+                number of ER iterations per period).
+            - `"ASR"`: (R_s R_m + I) / 2.
+            - `"HPR"`: (R_s (R_m + (beta - 1) P_m) + I + (1 - beta) P_m) / 2. Need to pass in the
+                parameter `beta`.
+            - `"RAAR"`: beta (R_s R_m + I) / 2 + (1 - beta) P_m. Need to pass in the parameter `beta`.
+            - `"DM"`:  I + beta (P_s ((1 + gammaS) P_m - gammaS I) - P_m ((1 + gammaM) P_s - gammaM I)).
+                Need to pass in the parameter `beta`, `gammaS`, and `gammaM`. If I don't pass in
+                `gammaS`, `gammaS` will be set to `-1 / beta`. If I don't pass in `gammaM`, `gammaM`
+                will be set to `1 / beta`.
+        - gridLevel (int or tuple[int]): If `None`, the algorithm is added to all levels of the grid.\
+            The coarsest grid is defined as level 0. Use tuples to add the same algorithm to multiple
+            levels of grid simultaneously.
         """
         if gridLevel is None:
             self.phasingMethod = []
@@ -1256,6 +1372,54 @@ class HMG(OSS):
 
 
 class Phasing(HMG):
+    """
+    General phasing class.
+
+    Using the following functions to set and control the reconstruction process.
+
+    Initialization
+    --------------
+    - `SetPatternMask(method, **kwargs)`
+    - `SetInitRealSpace(method, **kwargs)`
+    - `SetInitSupport(method, **kwargs)`
+
+    Multigrid
+    ---------
+    Set the number of levels for multiple grids.
+    - `SetMultigridMethod(num)`
+
+    Phasing Algorithm
+    -----------------
+    Successive calling can concatenate different algorithms.
+    - `SetPhasingMethod(method, girdLevel, **kwargs)`
+
+    Image Output
+    ------------
+    The following functions must be called to set output format.
+    - `SetOutput(path, period, processes)`
+    - `SetOutputFourierSpace(h5, mat)`
+    - `SetOutputRealSpace(h5, mat, png, tif)`
+    - `SetOutputSupport(h5, mat, png, tif)`
+
+    OSS Framework (optional)
+    ------------------------
+    Call only when needed. If not, OSS Framework will not be used.
+    - `SetOSSFramework(period, alpha)`
+
+    Support Update (optional)
+    -------------------------
+    If the following functions are not call, it will be phased with fixed support.
+    - `SetSupportUpdateMethod(self, period, offset)`
+    - `SetSupportUpdateBlur(radius, *args)`
+    - `SetSupportUpdateThreshold(threshold, *args)`
+    - `SetSupportUpdateArea(area, *args)`
+
+    Process Control
+    ---------------
+    - `Run([start, ]stop, **kwarg)`: Once the setup is complete, call `Run()` to start phasing.
+    - `Reset()`: Reset all settings (for future GUIs).
+    """
+
     def __init__(
         self,
         patternIntensity,
@@ -1313,6 +1477,9 @@ class Phasing(HMG):
         self.list = pd.DataFrame({"dir": dirList})
 
     def SynchronizeMag(self):
+        """
+        Synchronize the magnitude of multiple reconstruction results.
+        """
         try:
             model = cp.abs(self.realSpaceMod)
             s = 0
@@ -1349,6 +1516,9 @@ class Phasing(HMG):
                 self.realSpaceList[i], shift, axis=(0, 1))
 
     def SynchronizeArg(self):
+        """
+        Synchronize the argument (phase) of multiple reconstruction results.
+        """
         try:
             model = cp.conj(self.realSpaceMod)
             s = 0
@@ -1392,6 +1562,17 @@ class Phasing(HMG):
                     fio.WriteTIF(support, fileName + ".tif")
 
     def Run(self, *times, ave=False, RFupper=0.14, SPlower=0.8):
+        """
+        Once the setup is complete, call `Run([start, ]stop, **kwarg)` to start phasing.
+
+        Parameters
+        ----------
+        - start (int): Start number. The default value is 0.
+        - stop (int): End number.
+        - ave (Boolean): Whether to average multiple results.
+        - RFupper (float): The upper Fourier error limit for successful reconstruction.
+        - SPlower (float): The lower limit to generate support from averaged support.
+        """
         self.pool = Pool(processes=self.processes)
         outputPath = self.outputPath
         try:
@@ -1429,6 +1610,17 @@ class Phasing(HMG):
             self.Ave(RFupper, SPlower)
 
     def Ave(self, RFupper, SPlower):
+        """
+        Synchronize and average multiple results.
+        
+        Parameters
+        ----------
+        - start (int): Start number. The default value is 0.
+        - stop (int): End number.
+        - ave (Boolean): Whether to average multiple results.
+        - RFupper (float): The upper Fourier error limit for successful reconstruction.
+        - SPlower (float): The lower limit to generate support from averaged support.
+        """
         rf = self.ErrorFourier()
         self.list.insert(1, "RF", rf)
         success = rf < RFupper
@@ -1446,8 +1638,10 @@ class Phasing(HMG):
         self.realSpaceAve = cp.mean(self.realSpaceList, axis=0)
         self.realSpaceStd = cp.std(self.realSpaceList, axis=0)
         # Relative Standard Deviation
-        cor = correlate(self.supportAve, GaussianWindow(
-            self.size, min(self.size) / 2),)
+        cor = correlate(
+            self.supportAve,
+            GaussianWindow(self.size, min(self.size) / 2),
+        )
         shift = np.unravel_index(int(cp.argmax(cor)), self.size)
         self.supportAve = cp.roll(self.supportAve, shift, axis=(0, 1))
         self.supportLim = cp.roll(self.supportLim, shift, axis=(0, 1))
@@ -1494,6 +1688,9 @@ class Phasing(HMG):
         return cp.asnumpy(ef)
 
     def ErrorReal(self):
+        """
+        Error for real space.
+        """
         scaling = cp.sum(cp.abs(self.realSpaceMod)) / cp.sum(
             cp.abs(self.realSpaceList), axis=(1, 2)
         )
@@ -1503,7 +1700,7 @@ class Phasing(HMG):
         er = cp.sum(diff, axis=(1, 2)) / cp.sum(cp.abs(self.realSpaceMod))
         return cp.asnumpy(er)
 
-    def Sim(self, RFupper, SPlower, realSpaceMod, supportMod):
+    def Sim(self, RFupper, realSpaceMod):
         self.realSpaceMod = realSpaceMod
         ef = self.ErrorFourier()
         self.list.insert(1, "EF", ef)
@@ -1541,7 +1738,7 @@ def PRTF(data0, data):
     data = data * cp.sum(data0[data0 != 0] ** 2) / \
         cp.sum(data[data0 != 0] ** 2)
     xx, yy = SetFourierGrid(data0.shape)
-    frequencyGrid = cp.sqrt(xx ** 2 + yy ** 2)
+    frequencyGrid = cp.sqrt(xx**2 + yy**2)
     k = np.linspace(0, 0.5, 100, endpoint=False)
     prtf = cp.zeros(100)
     for i in range(100):
@@ -1588,7 +1785,7 @@ def FRC(data0, data):
     data0 = ishift(fft(data0))
     data = ishift(fft(data))
     xx, yy = SetFourierGrid(data0.shape)
-    frequencyGrid = cp.sqrt(xx ** 2 + yy ** 2)
+    frequencyGrid = cp.sqrt(xx**2 + yy**2)
     k = np.linspace(0, 0.5, 100, endpoint=False)
     frc0 = cp.zeros(100)
     frc1 = cp.zeros(100)
@@ -1601,32 +1798,12 @@ def FRC(data0, data):
 
 
 def twin(data0, data):
-    twin = cp.empty_like(data0, dtype='float')
+    data0 = data0*cp.sum(data)/cp.sum(data0)
     data1 = fft(cp.rot90(data0, 2))
     data0 = fft(data0)
     data = fft(data)
-    mag0 = cp.abs(data0)
-    ang1 = cp.angle(data1)
-    ang0 = cp.angle(data0)
-    ang = cp.angle(data)
-    # scaling = cp.sum(mag0) / cp.sum(cp.abs(data))
-    # data = data*scaling
-    error = (cp.abs(data)-mag0)/mag0
-    twin[cp.logical_or(error >= 0.05, cp.abs(
-        ang-ang0) == cp.abs(ang-ang1))] = 0
-    # twin[error >= 0.14] = 0
-    twin[cp.logical_and(error < 0.05, cp.abs(ang-ang0) < cp.abs(ang-ang1))] = 1
-    twin[cp.logical_and(error < 0.05, cp.abs(
-        ang-ang0) > cp.abs(ang-ang1))] = -1
-    return ishift(twin)
-
-
-def twin(data0, data):
-    data1 = fft(cp.rot90(data0, 2))
-    data0 = fft(data0)
-    data = fft(data)
-    error0 = (cp.abs(data-data0))/cp.abs(data0)
-    error1 = (cp.abs(data-data1))/cp.abs(data1)
+    error0 = (cp.abs(data - data0)) / cp.abs(data0)
+    error1 = (cp.abs(data - data1)) / cp.abs(data1)
     error0 = dl.from_dlpack(error0.toDlpack())
     error0 = nn.interpolate(
         error0[cp.newaxis, cp.newaxis, :],
@@ -1646,8 +1823,8 @@ def twin(data0, data):
     error = cp.min(cp.vstack((error0, error1)), axis=0)
     error0 = error0[0]
     error1 = error1[0]
-    twin = cp.empty_like(error, dtype='float')
-    twin[cp.logical_or(error >= 0.5, error0 == error1)] = 0
-    twin[cp.logical_and(error < 0.5, error0 < error1)] = 1
-    twin[cp.logical_and(error < 0.5, error0 > error1)] = -1
+    twin = cp.empty_like(error, dtype="float")
+    twin[cp.logical_or(error >= 0.6, error0 == error1)] = 0
+    twin[cp.logical_and(error < 0.6, error0 < error1)] = 1
+    twin[cp.logical_and(error < 0.6, error0 > error1)] = -1
     return ishift(twin)

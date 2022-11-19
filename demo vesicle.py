@@ -11,34 +11,40 @@ patternCoverLower = 0
 objectInput = fio.ReadFile(objectInputFile)
 objectInput = core.cp.sum(objectInput, axis=2)
 
-for poissonNoiseRatio in [0.025, 0.05]:
-    patternIntensity, patternMask, perfectSupport = core.Simulation(
+for emitPhotonsNumber in [1e8,5e7]:
+    (
+        patternIntensity,
+        patternNoiseFree,
+        patternMask,
+        perfectSupport,
+        noiseRatio,
+    ) = core.Simulation(
         objectInput,
         oversamplingRatio,
-        poissonNoiseRatio,
+        emitPhotonsNumber,
         patternCoverRatio,
         patternCoverShape,
         patternCoverUpper,
         patternCoverLower,
-    )[:3]
+    )[
+        :5
+    ]
 
     phasing = core.Phasing(patternIntensity)
     phasing.SetPatternMask("custom", patternMask=patternMask)
     phasing.SetInitRealSpace("random")
     phasing.SetInitSupport("auto", 0.02, 20)
 
-    phasing.SetSupportUpdateMethod(50)
+    phasing.SetSupportUpdateMethod(20)
     phasing.SetSupportUpdateBlur(20, 0.5, 0.04)
     phasing.SetSupportUpdateThreshold(0.4, 0.2, 0.01)
     phasing.SetSupportUpdateArea(0.05, 0.025, 0.01)
 
-    # phasing.SetOSSFramework(period=200)
-
     phasing.SetMultigridMethod(2)
-    phasing.SetPhasingMethod("HIO", 4000, 1, beta=0.9)
-    phasing.SetPhasingMethod("HIO", 2000, 0, beta=0.9)
-    phasing.SetPhasingMethod("ER", 400, 0)
-    phasing.SetOutputMethod("./vesicle/" + str(poissonNoiseRatio) + "/HMG/", 6000)
+    phasing.SetPhasingMethod("HIO", 2000, 1, beta=0.9)
+    phasing.SetPhasingMethod("HIO", 1000, 0, beta=0.9)
+    phasing.SetPhasingMethod("ER", 200, 0)
+    phasing.SetOutputMethod("./vesicle/" + "%.2f-%.0e" % (noiseRatio, emitPhotonsNumber) + "/HMG/", 3200)
     phasing.SetOutputRealSpace()
     phasing.SetOutputSupport()
     phasing.Run(100)
